@@ -1,0 +1,11 @@
+[client]
+interval_seconds = 45
+
+[datasets.test-pki]
+target = "/etc/example/test-pki"
+retain = 3
+group = "example-service"
+post_update = ["systemctl", "reload", "example-service"]
+
+[datasets.app-settings]
+target = "/etc/example/app-settings"

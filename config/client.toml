@@ -1,0 +1,8 @@
+[client]
+state_dir = "/var/lib/lan-distribution/client"
+interval_seconds = 60
+
+[datasets.shared-config]
+target = "/etc/lan-distribution/shared-config"
+retain = 2
+# post_update = ["systemctl", "reload", "example-service"]

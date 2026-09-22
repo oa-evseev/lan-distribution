@@ -1,0 +1,26 @@
+[Unit]
+Description=LAN Distribution server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lan-distribution
+Group=lan-distribution
+UMask=0077
+RuntimeDirectory=lan-distribution
+RuntimeDirectoryMode=0750
+ExecStart=/opt/lan-distribution/venv/bin/lan-distribution-server run
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lan-distribution/server /run/lan-distribution
+ReadOnlyPaths=/srv/lan-distribution
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

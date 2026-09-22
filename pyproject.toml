@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lan-distribution"
+version = "0.1.0"
+description = "Read-only dataset distribution for trusted local networks"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["cryptography>=44,<48", "zeroconf>=0.136,<1", "ifaddr>=0.2,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1", "mypy>=1.15,<2"]
+
+[project.scripts]
+lan-distribution = "lan_distribution.cli:main"
+lan-distribution-server = "lan_distribution.cli:server_main"
+lan-distribution-client = "lan_distribution.cli:client_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["E501", "S101", "S104", "S311", "S323", "S603"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["lan_distribution"]
+ignore_missing_imports = true
+check_untyped_defs = true

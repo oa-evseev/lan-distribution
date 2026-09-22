@@ -1,0 +1,9 @@
+[server]
+source_root = "/srv/lan-distribution"
+port = 9443
+instance_name = "lab-files"
+discovery = true
+
+[datasets]
+test-pki = "/srv/lan-distribution/test-pki"
+app-settings = "/srv/lan-distribution/app-settings"

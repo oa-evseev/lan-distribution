@@ -1,0 +1,21 @@
+[Unit]
+Description=LAN Distribution client replica
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/lan-distribution/client/credentials/current
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/opt/lan-distribution/venv/bin/lan-distribution-client run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
