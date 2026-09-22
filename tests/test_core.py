@@ -26,10 +26,19 @@ from lan_distribution.datasets import (
     extract_verified,
     publish,
     safe_path,
+    service_identity,
     snapshot,
     validate_manifest,
 )
 from lan_distribution.discovery import FoundServer
+
+
+@pytest.fixture(autouse=True)
+def test_service_identity(monkeypatch):
+    """The test host need not have the installed service account."""
+    monkeypatch.setattr(
+        "lan_distribution.datasets.service_identity", lambda: (os.getuid(), os.getgid())
+    )
 
 
 @pytest.mark.parametrize(
@@ -362,6 +371,120 @@ def test_atomic_published_dataset_store(tmp_path, monkeypatch):
             publish(state, "test-pki", source)
     finally:
         fifo.unlink()
+
+
+def test_published_storage_is_service_owned_without_changing_modes(tmp_path, monkeypatch):
+    state = tmp_path / "server-state"
+    source = tmp_path / "source"
+    private = source / "private"
+    private.mkdir(parents=True)
+    (private / "key.pem").write_text("secret")
+    (source / "certificate.pem").write_text("certificate")
+    private.chmod(0o700)
+    (private / "key.pem").chmod(0o600)
+    (source / "certificate.pem").chmod(0o644)
+    calls = []
+
+    def record_owner(path, uid, gid, *, follow_symlinks):
+        calls.append((Path(path), uid, gid, follow_symlinks))
+
+    monkeypatch.setattr("lan_distribution.datasets.os.chown", record_owner)
+    version, changed = publish(state, "test-pki", source, identity=(123, 456))
+    assert changed
+    root = state / "datasets/test-pki"
+    final = root / "versions" / version
+    assert (final / "private").stat().st_mode & 0o777 == 0o700
+    assert (final / "private/key.pem").stat().st_mode & 0o777 == 0o600
+    assert (final / "certificate.pem").stat().st_mode & 0o777 == 0o644
+    owned = {
+        path for path, uid, gid, nofollow in calls if (uid, gid, nofollow) == (123, 456, False)
+    }
+    assert {root, root / "versions"} <= owned
+    assert any(path.name.startswith(".stage-") for path in owned)
+    assert {Path("private"), Path("private/key.pem"), Path("certificate.pem")} <= {
+        path.relative_to(
+            next(parent for parent in path.parents if parent.name.startswith(".stage-"))
+        )
+        for path in owned
+        if any(parent.name.startswith(".stage-") for parent in path.parents)
+    }
+    assert any(path.name.startswith(".current-") for path in owned)
+
+
+def test_ownership_failure_keeps_previous_published_version(tmp_path, monkeypatch):
+    state = tmp_path / "server-state"
+    source = tmp_path / "source"
+    source.mkdir()
+    value = source / "value"
+    value.write_text("first")
+    first, _ = publish(state, "test-pki", source)
+    value.write_text("second")
+    real_set_owner = __import__("lan_distribution.datasets", fromlist=["_"])._set_owner
+
+    def fail_stage_owner(path, identity):
+        if path.name.startswith(".stage-"):
+            raise OSError("synthetic ownership failure")
+        real_set_owner(path, identity)
+
+    monkeypatch.setattr("lan_distribution.datasets._set_owner", fail_stage_owner)
+    with pytest.raises(OSError, match="ownership failure"):
+        publish(state, "test-pki", source)
+    root = state / "datasets/test-pki"
+    assert root.joinpath("current").readlink() == Path("versions") / first
+    assert not list((root / "versions").glob(".stage-*"))
+
+
+def test_identical_publication_repairs_ownership_without_new_version(tmp_path, monkeypatch):
+    state = tmp_path / "server-state"
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "value").write_text("unchanged")
+    version, _ = publish(state, "test-pki", source)
+    calls = []
+    monkeypatch.setattr(
+        "lan_distribution.datasets.os.chown",
+        lambda path, uid, gid, *, follow_symlinks: calls.append(
+            (Path(path), uid, gid, follow_symlinks)
+        ),
+    )
+    assert publish(state, "test-pki", source, identity=(123, 456)) == (version, False)
+    assert len(list((state / "datasets/test-pki/versions").iterdir())) == 1
+    assert any(path.name == "value" and (uid, gid) == (123, 456) for path, uid, gid, _ in calls)
+
+
+def test_ownership_repair_does_not_follow_symlinks(tmp_path, monkeypatch):
+    state = tmp_path / "server-state"
+    source = tmp_path / "source"
+    source.mkdir()
+    value = source / "value"
+    value.write_text("first")
+    publish(state, "test-pki", source)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "secret"
+    outside_file.write_text("outside")
+    link = state / "datasets/test-pki/versions/external-link"
+    link.symlink_to(outside, target_is_directory=True)
+    calls = []
+    monkeypatch.setattr(
+        "lan_distribution.datasets.os.chown",
+        lambda path, uid, gid, *, follow_symlinks: calls.append((Path(path), follow_symlinks)),
+    )
+    value.write_text("second")
+    publish(state, "test-pki", source, identity=(123, 456))
+    assert (link, False) in calls
+    assert outside not in {path for path, _ in calls}
+    assert outside_file not in {path for path, _ in calls}
+
+
+def test_service_identity_uses_installed_account_names(monkeypatch):
+    monkeypatch.setattr(
+        "lan_distribution.datasets.pwd.getpwnam", lambda name: type("P", (), {"pw_uid": 123})()
+    )
+    monkeypatch.setattr(
+        "lan_distribution.datasets.grp.getgrnam", lambda name: type("G", (), {"gr_gid": 456})()
+    )
+    assert service_identity() == (123, 456)
 
 
 def test_dataset_permission_modes_and_version_identity(tmp_path, monkeypatch):

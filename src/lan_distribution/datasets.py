@@ -1,10 +1,12 @@
 """Canonical snapshots and deliberately narrow TAR extraction."""
 
 import contextlib
+import grp
 import hashlib
 import io
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -16,6 +18,9 @@ from typing import Any
 
 from . import defaults
 from .config import name
+
+SERVICE_USER = "lan-distribution"
+SERVICE_GROUP = "lan-distribution"
 
 
 def canonical(value: Any) -> bytes:
@@ -157,6 +162,29 @@ def _safe_directory(path: Path, mode: int = 0o700) -> None:
     path.chmod(mode)
 
 
+def service_identity() -> tuple[int, int]:
+    """Return the uid/gid used by the installed server daemon."""
+    return pwd.getpwnam(SERVICE_USER).pw_uid, grp.getgrnam(SERVICE_GROUP).gr_gid
+
+
+def _set_owner(path: Path, identity: tuple[int, int]) -> None:
+    """Set ownership without resolving a possible symlink at ``path``."""
+    os.chown(path, *identity, follow_symlinks=False)
+
+
+def _repair_ownership(path: Path, identity: tuple[int, int]) -> None:
+    """Repair a managed tree without traversing symlinks or special files."""
+    status = path.lstat()
+    if stat.S_ISDIR(status.st_mode):
+        with os.scandir(path) as entries:
+            children = [Path(entry.path) for entry in entries]
+        for child in children:
+            _repair_ownership(child, identity)
+    elif not (stat.S_ISREG(status.st_mode) or stat.S_ISLNK(status.st_mode)):
+        raise ValueError(f"unsupported managed store entry: {path}")
+    _set_owner(path, identity)
+
+
 def current_published(state_dir: Path, dataset: str) -> Path | None:
     root = published_root(state_dir, dataset)
     current = root / "current"
@@ -172,7 +200,11 @@ def current_published(state_dir: Path, dataset: str) -> Path | None:
 
 
 def publish(
-    state_dir: Path, dataset: str, source: Path, limit: int = defaults.MAX_FILE
+    state_dir: Path,
+    dataset: str,
+    source: Path,
+    limit: int = defaults.MAX_FILE,
+    identity: tuple[int, int] | None = None,
 ) -> tuple[str, bool]:
     """Build a private immutable version, then atomically switch ``current``.
 
@@ -181,10 +213,14 @@ def publish(
     """
     manifest, archive = snapshot(source, limit)
     version_id = str(manifest["version"])
+    identity = identity or service_identity()
     root = published_root(state_dir, dataset)
     versions = root / "versions"
     _safe_directory(root)
     _safe_directory(versions)
+    # This also repairs publications made before server-managed storage had a
+    # service owner.  It is deliberately limited to this dataset's store.
+    _repair_ownership(root, identity)
     old = current_published(state_dir, dataset)
     if old is not None and old.name == version_id:
         return version_id, False
@@ -197,6 +233,7 @@ def publish(
         try:
             stage.chmod(0o700)
             extract_verified(archive, manifest, stage)
+            _repair_ownership(stage, identity)
             _fsync_directory(stage)
             os.rename(stage, final)
             _fsync_directory(versions)
@@ -207,6 +244,7 @@ def publish(
     temporary = root / f".current-{uuid.uuid4().hex}"
     try:
         temporary.symlink_to(f"versions/{version_id}")
+        _set_owner(temporary, identity)
         os.replace(temporary, root / "current")
         _fsync_directory(root)
     finally:

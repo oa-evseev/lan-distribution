@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import sys
 import threading
@@ -17,6 +18,14 @@ from lan_distribution.config import ClientConfig, DatasetConfig, ServerConfig
 from lan_distribution.crypto import new_client_key_csr, sign_client_csr
 from lan_distribution.datasets import extract_verified, publish, validate_manifest
 from lan_distribution.server import DistributionServer, control, initialize
+
+
+@pytest.fixture(autouse=True)
+def test_service_identity(monkeypatch):
+    """The test host need not have the installed service account."""
+    monkeypatch.setattr(
+        "lan_distribution.datasets.service_identity", lambda: (os.getuid(), os.getgid())
+    )
 
 
 @pytest.fixture
