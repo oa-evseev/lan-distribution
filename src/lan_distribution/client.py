@@ -85,19 +85,12 @@ def _same_tree(left: Path, right: Path) -> bool:
     return True
 
 
-def _fsync_tree(root: Path) -> None:
-    for directory, _, files in os.walk(root, topdown=False):
-        for filename in files:
-            fd = os.open(Path(directory) / filename, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def probe(url: str) -> tuple[dict[str, str], str]:
@@ -438,7 +431,7 @@ class Client:
                     os.chown(root, -1, group_id)
                     for item in directories + files:
                         os.chown(Path(root) / item, -1, group_id)
-            _fsync_tree(stage)
+            _fsync_directory(stage)
             final = versions / version
             if final.exists() or final.is_symlink():
                 if not final.is_dir() or final.is_symlink() or not _same_tree(stage, final):

@@ -1,7 +1,9 @@
 import argparse
+import hashlib
 import io
 import json
 import os
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -268,7 +270,7 @@ def test_snapshot_and_archive_safety(tmp_path):
     output.mkdir()
     extract_verified(archive, manifest, output)
     assert (output / "file").read_text() == "content"
-    assert (output / "file").stat().st_mode & 0o222 == 0
+    assert (output / "file").stat().st_mode & 0o777 == (source / "file").stat().st_mode & 0o777
     with pytest.raises(ValueError, match="checksum"):
         extract_verified(archive.replace(b"content", b"corrupt"), manifest, tmp_path / "tampered")
     with pytest.raises(ValueError, match="size limit"):
@@ -296,6 +298,88 @@ def test_snapshot_and_archive_safety(tmp_path):
         extract_verified(bad.getvalue(), manifest, tmp_path / "bad")
 
 
+def test_dataset_permission_modes_and_version_identity(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    private = source / "private"
+    private.mkdir()
+    public = source / "public"
+    public.mkdir()
+    files = {
+        source / "plain.txt": ("plain", 0o644),
+        source / "secret.txt": ("secret", 0o600),
+        source / "run": ("#!/bin/sh\n", 0o755),
+        private / "key.pem": ("key", 0o600),
+        public / "certificate.pem": ("cert", 0o644),
+    }
+    for path, (content, mode) in files.items():
+        path.write_text(content)
+        path.chmod(mode)
+    private.chmod(0o700)
+    public.chmod(0o755)
+
+    manifest, archive = snapshot(source)
+    modes = {entry["path"]: entry["mode"] for entry in manifest["entries"]}
+    assert modes == {
+        "plain.txt": 0o644,
+        "private": 0o700,
+        "private/key.pem": 0o600,
+        "public": 0o755,
+        "public/certificate.pem": 0o644,
+        "run": 0o755,
+        "secret.txt": 0o600,
+    }
+    original_version = manifest["version"]
+    (source / "plain.txt").chmod(0o600)
+    assert snapshot(source)[0]["version"] != original_version
+    (source / "plain.txt").chmod(0o644)
+
+    # Special source bits are intentionally absent from both manifest and output.
+    (source / "run").chmod(0o7755)
+    special_manifest, special_archive = snapshot(source)
+    assert (
+        next(entry for entry in special_manifest["entries"] if entry["path"] == "run")["mode"]
+        == 0o755
+    )
+    special_output = tmp_path / "special-output"
+    extract_verified(special_archive, special_manifest, special_output)
+    assert (special_output / "run").stat().st_mode & 0o7000 == 0
+    (source / "run").chmod(0o755)
+
+    observed_file_modes: list[int] = []
+    real_fchmod = os.fchmod
+
+    def observe_initial_mode(fd, mode):
+        current = os.fstat(fd).st_mode
+        if stat.S_ISREG(current):
+            observed_file_modes.append(stat.S_IMODE(current))
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr("lan_distribution.datasets.os.fchmod", observe_initial_mode)
+    output = tmp_path / "output"
+    output.mkdir()
+    old_umask = os.umask(0o000)
+    try:
+        extract_verified(archive, manifest, output)
+    finally:
+        os.umask(old_umask)
+    for path, (_, mode) in files.items():
+        relative = path.relative_to(source)
+        assert (output / relative).stat().st_mode & 0o777 == mode
+    assert (output / "private").stat().st_mode & 0o777 == 0o700
+    assert (output / "public").stat().st_mode & 0o777 == 0o755
+    assert observed_file_modes == [0o000] * len(files)
+    assert (output / "run").stat().st_mode & 0o7000 == 0
+
+    invalid = json.loads(json.dumps(manifest))
+    invalid["entries"][0]["mode"] = 0o1000
+    invalid["version"] = hashlib.sha256(
+        json.dumps(invalid["entries"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="invalid mode"):
+        validate_manifest(invalid)
+
+
 def test_install_targets_and_preservation():
     root = Path(__file__).resolve().parents[1]
     makefile = (root / "Makefile").read_text()
@@ -321,6 +405,9 @@ def test_replica_modes_with_systemd_umask(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
     (source / "file").write_text("synthetic")
+    (source / "file").chmod(0o600)
+    (source / "private").mkdir()
+    (source / "private").chmod(0o700)
     manifest, archive = snapshot(source)
     target = tmp_path / "target"
     old = os.umask(0o077)
@@ -343,7 +430,31 @@ def test_replica_modes_with_systemd_umask(tmp_path, monkeypatch):
         client.state / "datasets/shared/versions",
     ):
         assert path.stat().st_mode & 0o777 == 0o711
-    assert (target / "file").stat().st_mode & 0o777 == 0o444
+    assert (target / "file").stat().st_mode & 0o777 == 0o600
+    assert (target / "private").stat().st_mode & 0o777 == 0o700
+
+
+def test_atomic_update_preserves_changed_modes(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    file = source / "file"
+    file.write_text("same bytes")
+    file.chmod(0o644)
+    client = Client(ClientConfig(tmp_path / "client"))
+    target = tmp_path / "target"
+
+    def fake_request(method, path):
+        manifest, archive = snapshot(source)
+        return 200, json.dumps(manifest).encode() if path.endswith("manifest") else archive
+
+    monkeypatch.setattr(client, "request", fake_request)
+    assert client.sync_one("shared", DatasetConfig(target))
+    first = (client.state / "datasets/shared/current").readlink()
+    assert (target / "file").stat().st_mode & 0o777 == 0o644
+    file.chmod(0o600)
+    assert client.sync_one("shared", DatasetConfig(target))
+    assert (target / "file").stat().st_mode & 0o777 == 0o600
+    assert (client.state / "datasets/shared/current").readlink() != first
 
 
 def test_version_collision_and_interrupted_activation(tmp_path, monkeypatch):

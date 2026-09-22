@@ -1,5 +1,6 @@
 """Canonical snapshots and deliberately narrow TAR extraction."""
 
+import contextlib
 import hashlib
 import io
 import json
@@ -174,13 +175,19 @@ def extract_verified(archive_bytes: bytes, manifest: dict[str, Any], destination
         raise ValueError("archive exceeds size limit")
     if destination.is_symlink() or (destination.exists() and any(destination.iterdir())):
         raise ValueError("extraction destination must be empty")
+    if not destination.exists():
+        destination.mkdir(mode=0o700)
+        destination.chmod(0o700)
     entries = validate_manifest(manifest)
     if sum(entry.get("size", 0) for entry in entries) > defaults.MAX_BODY:
         raise ValueError("manifest exceeds size limit")
     expected = {entry["path"]: entry for entry in entries}
     seen: set[str] = set()
-    directory_modes: list[tuple[Path, int]] = []
-    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+    directory_fds: list[tuple[int, int]] = []
+    with (
+        contextlib.ExitStack() as cleanup,
+        tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive,
+    ):
         for member in archive:
             if member.name.endswith("//") or (member.name.endswith("/") and not member.isdir()):
                 raise ValueError("noncanonical archive member path")
@@ -193,12 +200,18 @@ def extract_verified(archive_bytes: bytes, manifest: dict[str, Any], destination
             if any(part.is_symlink() for part in target.parents if part != destination.parent):
                 raise ValueError("archive path traverses symlink")
             if entry["type"] == "dir" and member.isdir() and member.size == 0:
-                target.mkdir(parents=True, exist_ok=True)
-                directory_modes.append((target, entry["mode"] & ~0o222))
+                if not target.parent.is_dir() or target.parent.is_symlink():
+                    raise ValueError("archive directory parent is unavailable")
+                target.mkdir(mode=0o700)
+                # mkdir is filtered by umask.  Keep the staging tree private
+                # while it is populated, irrespective of that process setting.
+                target.chmod(0o700)
+                fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                cleanup.callback(os.close, fd)
+                directory_fds.append((fd, entry["mode"]))
             elif entry["type"] == "file" and member.isfile() and member.size == entry["size"]:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists() or target.is_symlink():
-                    raise ValueError("archive target collision")
+                if not target.parent.is_dir() or target.parent.is_symlink():
+                    raise ValueError("archive file parent is unavailable")
                 stream = archive.extractfile(member)
                 if stream is None:
                     raise ValueError("missing file content")
@@ -208,11 +221,22 @@ def extract_verified(archive_bytes: bytes, manifest: dict[str, Any], destination
                     or len(data) != entry["size"]
                 ):
                     raise ValueError("file checksum mismatch")
-                target.write_bytes(data)
-                target.chmod(entry["mode"] & ~0o222)
+                # Do not let umask choose an interim, permissive mode.  An
+                # empty mode is safe even for a final 0000 file; the already
+                # open descriptor remains writable until it is closed.
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o000)
+                try:
+                    with os.fdopen(fd, "wb", closefd=False) as output:
+                        output.write(data)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.fchmod(fd, entry["mode"])
+                finally:
+                    os.close(fd)
             else:
                 raise ValueError("unsupported archive member")
-    if seen != set(expected):
-        raise ValueError("archive does not match manifest")
-    for path, mode in sorted(directory_modes, key=lambda item: len(item[0].parts), reverse=True):
-        path.chmod(mode)
+        if seen != set(expected):
+            raise ValueError("archive does not match manifest")
+        for fd, mode in directory_fds:
+            os.fchmod(fd, mode)
+            os.fsync(fd)
