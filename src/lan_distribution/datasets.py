@@ -6,12 +6,16 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import tarfile
+import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import defaults
+from .config import name
 
 
 def canonical(value: Any) -> bytes:
@@ -128,6 +132,87 @@ def snapshot(source: Path, limit: int = defaults.MAX_FILE) -> tuple[dict[str, An
     if len(output.getvalue()) > defaults.MAX_BODY:
         raise ValueError("archive exceeds request limit")
     return manifest, output.getvalue()
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def published_root(state_dir: Path, dataset: str) -> Path:
+    """Return the controlled store path after validating its sole dynamic component."""
+    name(dataset)
+    return state_dir / "datasets" / dataset
+
+
+def _safe_directory(path: Path, mode: int = 0o700) -> None:
+    if path.is_symlink():
+        raise ValueError(f"managed store path is a symlink: {path}")
+    path.mkdir(mode=mode, parents=True, exist_ok=True)
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError(f"managed store path is not a directory: {path}")
+    path.chmod(mode)
+
+
+def current_published(state_dir: Path, dataset: str) -> Path | None:
+    root = published_root(state_dir, dataset)
+    current = root / "current"
+    if not current.is_symlink():
+        return None
+    target = current.readlink().as_posix()
+    if not re.fullmatch(r"versions/[0-9a-f]{64}", target):
+        raise ValueError(f"published current link points outside versions: {current}")
+    version = root / target
+    if not version.is_dir() or version.is_symlink():
+        raise ValueError(f"published current version is unavailable: {current}")
+    return version
+
+
+def publish(
+    state_dir: Path, dataset: str, source: Path, limit: int = defaults.MAX_FILE
+) -> tuple[str, bool]:
+    """Build a private immutable version, then atomically switch ``current``.
+
+    The archive is deliberately re-extracted into the managed store: this reuses
+    the protocol's validation and safe interim permission handling.
+    """
+    manifest, archive = snapshot(source, limit)
+    version_id = str(manifest["version"])
+    root = published_root(state_dir, dataset)
+    versions = root / "versions"
+    _safe_directory(root)
+    _safe_directory(versions)
+    old = current_published(state_dir, dataset)
+    if old is not None and old.name == version_id:
+        return version_id, False
+    final = versions / version_id
+    if final.exists() or final.is_symlink():
+        if not final.is_dir() or final.is_symlink() or snapshot(final, limit)[0] != manifest:
+            raise ValueError(f"published version is invalid: {version_id}")
+    else:
+        stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=versions))
+        try:
+            stage.chmod(0o700)
+            extract_verified(archive, manifest, stage)
+            _fsync_directory(stage)
+            os.rename(stage, final)
+            _fsync_directory(versions)
+        except BaseException:
+            if stage.exists() and not stage.is_symlink():
+                shutil.rmtree(stage)
+            raise
+    temporary = root / f".current-{uuid.uuid4().hex}"
+    try:
+        temporary.symlink_to(f"versions/{version_id}")
+        os.replace(temporary, root / "current")
+        _fsync_directory(root)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink()
+    return version_id, True
 
 
 def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:

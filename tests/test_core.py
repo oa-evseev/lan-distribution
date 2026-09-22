@@ -21,7 +21,14 @@ from lan_distribution.config import (
     load_client,
     load_server,
 )
-from lan_distribution.datasets import extract_verified, safe_path, snapshot, validate_manifest
+from lan_distribution.datasets import (
+    current_published,
+    extract_verified,
+    publish,
+    safe_path,
+    snapshot,
+    validate_manifest,
+)
 from lan_distribution.discovery import FoundServer
 
 
@@ -226,6 +233,14 @@ def test_config(tmp_path):
         '[server]\nsource_root="/srv/lan-distribution"\n[datasets]\nshared="/srv/lan-distribution/shared"\n'
     )
     assert load_server(server).datasets["shared"] == Path("/srv/lan-distribution/shared")
+    server.write_text(
+        '[server]\nsource_root="/srv/lan-distribution"\n[datasets]\n'
+        'shared="/srv/lan-distribution/shared"\n[datasets.test-pki]\npublished=true\n'
+    )
+    assert load_server(server).datasets == {
+        "shared": Path("/srv/lan-distribution/shared"),
+        "test-pki": None,
+    }
     client = tmp_path / "client.toml"
     client.write_text(
         '[client]\ninterval_seconds=12\n[datasets.shared]\npost_update=["true"]\ngroup="example-service"\n'
@@ -296,6 +311,57 @@ def test_snapshot_and_archive_safety(tmp_path):
         tar.addfile(info, io.BytesIO())
     with pytest.raises(ValueError):
         extract_verified(bad.getvalue(), manifest, tmp_path / "bad")
+
+
+def test_atomic_published_dataset_store(tmp_path, monkeypatch):
+    state = tmp_path / "server-state"
+    source = tmp_path / "source"
+    source.mkdir()
+    secret = source / "key.pem"
+    secret.write_text("first-key")
+    secret.chmod(0o600)
+    (source / "cert.pem").write_text("first-cert")
+
+    first, changed = publish(state, "test-pki", source)
+    assert changed
+    root = state / "datasets/test-pki"
+    assert root.joinpath("current").readlink() == Path("versions") / first
+    old = current_published(state, "test-pki")
+    assert old is not None
+    assert (old / "key.pem").read_text() == "first-key"
+    assert (old / "key.pem").stat().st_mode & 0o777 == 0o600
+    assert publish(state, "test-pki", source) == (first, False)
+    assert len(list((root / "versions").iterdir())) == 1
+
+    secret.write_text("second-key")
+    second, changed = publish(state, "test-pki", source)
+    assert changed and second != first
+    assert root.joinpath("current").readlink() == Path("versions") / second
+    assert (root / "versions" / first / "key.pem").read_text() == "first-key"
+    assert (root / "versions" / second / "key.pem").read_text() == "second-key"
+    secret.chmod(0o640)
+    third, changed = publish(state, "test-pki", source)
+    assert changed and third != second
+
+    def fail_extract(*args, **kwargs):
+        raise OSError("synthetic staging failure")
+
+    secret.write_text("failed-key")
+    monkeypatch.setattr("lan_distribution.datasets.extract_verified", fail_extract)
+    with pytest.raises(OSError, match="staging failure"):
+        publish(state, "test-pki", source)
+    assert root.joinpath("current").readlink() == Path("versions") / third
+    assert not list((root / "versions").glob(".stage-*"))
+
+    with pytest.raises(ValueError, match="dataset name"):
+        publish(state, "../escape", source)
+    fifo = source / "fifo"
+    os.mkfifo(fifo)
+    try:
+        with pytest.raises(ValueError, match="unsupported"):
+            publish(state, "test-pki", source)
+    finally:
+        fifo.unlink()
 
 
 def test_dataset_permission_modes_and_version_identity(tmp_path, monkeypatch):

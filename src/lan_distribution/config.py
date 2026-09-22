@@ -52,7 +52,8 @@ class ServerConfig:
     port: int = 9443
     instance_name: str = "lan-distribution"
     discovery: bool = True
-    datasets: dict[str, Path] = field(default_factory=dict)
+    # A None source denotes a server-managed, published dataset.
+    datasets: dict[str, Path | None] = field(default_factory=dict)
     max_dataset_bytes: int = defaults.MAX_FILE
 
 
@@ -101,11 +102,17 @@ def load_server(path: Path = defaults.SERVER_CONFIG) -> ServerConfig:
     )
     root = _absolute_path(server.get("source_root", defaults.SOURCE), "source_root")
     dataset_data = _table(data, "datasets")
-    datasets: dict[str, Path] = {}
+    datasets: dict[str, Path | None] = {}
     for key, value in dataset_data.items():
         name(key)
+        if isinstance(value, dict):
+            _keys(value, {"published"})
+            if value.get("published") is not True:
+                raise ConfigError(f"dataset {key} must set published=true")
+            datasets[key] = None
+            continue
         if not isinstance(value, str):
-            raise ConfigError(f"dataset {key} path must be a string")
+            raise ConfigError(f"dataset {key} path must be a string or published table")
         path = Path(value)
         if not path.is_absolute() or not path.resolve(strict=False).is_relative_to(
             root.resolve(strict=False)

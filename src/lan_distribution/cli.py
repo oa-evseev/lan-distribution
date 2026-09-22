@@ -11,6 +11,7 @@ from pathlib import Path
 from . import defaults
 from .client import Client, ClientError, RegistrationClosed, probe
 from .config import ConfigError, load_client, load_server, name
+from .datasets import publish
 from .discovery import FoundServer, advertise, discover
 from .server import DistributionServer, control, initialize
 
@@ -133,6 +134,9 @@ def server_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(cmd)
         p.add_argument("client_id")
         p.add_argument("dataset")
+    publish_parser = sub.add_parser("publish")
+    publish_parser.add_argument("dataset")
+    publish_parser.add_argument("source", type=Path)
     return parser
 
 
@@ -171,7 +175,20 @@ def server_dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "datasets":
         for dataset, source in sorted(config.datasets.items()):
-            print(f"{dataset}\t{source}")
+            print(f"{dataset}\t{'published' if source is None else source}")
+        return 0
+    if args.command == "publish":
+        dataset = name(args.dataset)
+        if config.datasets.get(dataset, object()) is not None:
+            raise ValueError("dataset is not configured as published")
+        if not args.source.is_absolute():
+            raise ValueError("source directory must be absolute")
+        initialize(config)
+        version, changed = publish(config.state_dir, dataset, args.source, config.max_dataset_bytes)
+        if changed:
+            print(f"Published {dataset} version {version}.")
+        else:
+            print(f"{dataset} already at version {version}; no changes.")
         return 0
     with sqlite3.connect(config.state_dir / "server.db") as db:
         if args.command == "clients":

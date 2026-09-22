@@ -80,6 +80,7 @@ sudo lan-distribution-server grants <client-id>
 sudo lan-distribution-server grant <client-id> shared-config
 sudo lan-distribution-server deny <client-id> shared-config
 sudo lan-distribution-server datasets
+sudo lan-distribution-server publish test-pki /etc/example/pki-staging
 ```
 
 `revoke` is permanent for that client ID; re-enrollment creates a new ID. Newly enrolled clients receive access to every configured dataset. Restrict that immediately with `deny` where needed, or change the policy before allowing enrollment. Disabled and revoked clients cannot use datasets or rotate. Enrollment windows do not affect registered clients.
@@ -93,6 +94,15 @@ Server config is `/etc/lan-distribution/server.toml`; the installer copies [conf
 shared-config = "/srv/lan-distribution/shared-config"
 test-pki = "/srv/lan-distribution/test-pki"
 ```
+
+Those are source-backed datasets: the server snapshots their current source tree for each request. For content that must change as one unit (for example a certificate and private key), configure a server-managed published dataset instead:
+
+```toml
+[datasets.test-pki]
+published = true
+```
+
+It has no mutable configured source. Publish a complete staging tree with `sudo lan-distribution-server publish test-pki /etc/example/pki-staging`. The server validates and privately copies it into `/var/lib/lan-distribution/server/datasets/test-pki/versions/<version-id>/`, then atomically replaces `current` with a symlink to that immutable version. Repeating identical content is a no-op. Old versions are retained (no automatic pruning in this release), so a client that has received a manifest always fetches that exact immutable version even if a later publication becomes current.
 
 Restart the server after changing its config. A source tree may contain regular files and directories; symlinks, hard links, sockets, and special files are rejected. A dataset has a 32 MiB default source limit and a 40 MiB maximum response size. No arbitrary path can be requested through the API. For private source files, grant the dedicated `lan-distribution` user read access through ownership, a group, or ACLs; do not make secrets world-readable just to serve them.
 

@@ -1,3 +1,4 @@
+import json
 import socket
 import sys
 import threading
@@ -14,7 +15,8 @@ from cryptography.x509.oid import NameOID
 from lan_distribution.client import Client, ClientError, RegistrationClosed, probe
 from lan_distribution.config import ClientConfig, DatasetConfig, ServerConfig
 from lan_distribution.crypto import new_client_key_csr, sign_client_csr
-from lan_distribution.server import DistributionServer, control
+from lan_distribution.datasets import extract_verified, publish, validate_manifest
+from lan_distribution.server import DistributionServer, control, initialize
 
 
 @pytest.fixture
@@ -153,6 +155,59 @@ def test_disabled_and_wrong_server(live):
     identity["server_id"] = "different"
     with pytest.raises(ClientError):
         client.save_trust(identity)
+
+
+def test_published_snapshot_is_pinned_and_authorized(tmp_path):
+    source = tmp_path / "published-source"
+    source.mkdir()
+    (source / "cert.pem").write_text("certificate-a")
+    (source / "key.pem").write_text("private-a")
+    (source / "key.pem").chmod(0o600)
+    config = ServerConfig(
+        state_dir=tmp_path / "server",
+        runtime_dir=tmp_path / "run",
+        source_root=tmp_path,
+        host="127.0.0.1",
+        port=0,
+        discovery=False,
+        datasets={"test-pki": None},
+    )
+    initialize(config)
+    version_a, _ = publish(config.state_dir, "test-pki", source)
+    server = DistributionServer(config, control_enabled=False)
+    thread = threading.Thread(target=server.start, daemon=True)
+    thread.start()
+    try:
+        client = Client(ClientConfig(tmp_path / "client"))
+        client.save_trust(probe(f"https://127.0.0.1:{server.server_address[1]}")[0])
+        server.open(20)
+        client_id = client.enroll("published-test")
+        server.close_window()
+        status, body = client.request("GET", "/v1/datasets/test-pki/manifest")
+        assert status == 200
+        manifest_a = json.loads(body)
+        validate_manifest(manifest_a)
+        assert manifest_a["version"] == version_a
+
+        (source / "cert.pem").write_text("certificate-b")
+        version_b, changed = publish(config.state_dir, "test-pki", source)
+        assert changed and version_b != version_a
+        status, archive_a = client.request(
+            "GET", f"/v1/datasets/test-pki/archive/{manifest_a['version']}"
+        )
+        assert status == 200
+        replica = tmp_path / "replica-a"
+        extract_verified(archive_a, manifest_a, replica)
+        assert (replica / "cert.pem").read_text() == "certificate-a"
+        assert (replica / "key.pem").read_text() == "private-a"
+
+        with server.db() as db:
+            db.execute("DELETE FROM grants WHERE client_id=? AND dataset='test-pki'", (client_id,))
+        assert client.request("GET", "/v1/datasets/test-pki/manifest")[0] == 403
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
 
 
 def test_collision_hooks_and_failed_rotation(live, monkeypatch):

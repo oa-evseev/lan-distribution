@@ -7,3 +7,6 @@ discovery = true
 [datasets]
 test-pki = "/srv/lan-distribution/test-pki"
 app-settings = "/srv/lan-distribution/app-settings"
+
+[datasets.test-pki]
+published = true

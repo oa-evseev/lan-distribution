@@ -406,7 +406,7 @@ class Client:
         ):
             ensure_target()
             return False
-        status, archive = self.request("GET", f"/v1/datasets/{dataset}/archive")
+        status, archive = self.request("GET", f"/v1/datasets/{dataset}/archive/{version}")
         if status != 200:
             raise ClientError(f"cannot read {dataset} archive: HTTP {status}")
         datasets_root = self.state / "datasets"

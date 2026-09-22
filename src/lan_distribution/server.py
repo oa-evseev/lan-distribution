@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import socket
 import socketserver
 import sqlite3
@@ -22,7 +23,7 @@ from cryptography.x509.oid import NameOID
 from . import defaults
 from .config import ServerConfig, name
 from .crypto import generate_server, sign_client_csr
-from .datasets import snapshot
+from .datasets import current_published, published_root, snapshot
 
 LOG = logging.getLogger(__name__)
 
@@ -213,14 +214,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         parts = path.split("/")
-        if (
-            len(parts) != 5
-            or parts[1:3] != ["v1", "datasets"]
-            or parts[4] not in ("manifest", "archive")
-        ):
+        if len(parts) not in (5, 6) or parts[1:3] != ["v1", "datasets"]:
             self.reply(404, {"error": "not found"})
             return
         dataset = unquote(parts[3])
+        resource = parts[4]
+        requested_version = parts[5] if len(parts) == 6 else None
+        if resource not in ("manifest", "archive") or (
+            requested_version is not None and resource != "archive"
+        ):
+            self.reply(404, {"error": "not found"})
+            return
         try:
             name(dataset)
         except ValueError:
@@ -230,14 +234,29 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(403, {"error": "dataset not authorized"})
             return
         try:
-            manifest, archive = snapshot(
-                self.server.config.datasets[dataset], self.server.config.max_dataset_bytes
-            )
+            source = self.server.config.datasets[dataset]
+            if source is None:
+                if resource == "manifest":
+                    source = current_published(self.server.config.state_dir, dataset)
+                    if source is None:
+                        raise ValueError("dataset has not been published")
+                else:
+                    if requested_version is None or not re.fullmatch(
+                        r"[0-9a-f]{64}", requested_version
+                    ):
+                        raise ValueError("published archive request requires a version")
+                    root = published_root(self.server.config.state_dir, dataset)
+                    source = root / "versions" / requested_version
+                    if not source.is_dir() or source.is_symlink():
+                        raise ValueError("published version is unavailable")
+            manifest, archive = snapshot(source, self.server.config.max_dataset_bytes)
+            if requested_version is not None and manifest["version"] != requested_version:
+                raise ValueError("published version does not match its identity")
         except (OSError, ValueError) as exc:
             LOG.warning("cannot snapshot %s: %s", dataset, exc)
             self.reply(503, {"error": "dataset unavailable"})
             return
-        if parts[4] == "manifest":
+        if resource == "manifest":
             self.reply(200, manifest)
         else:
             self.send_response(200)
